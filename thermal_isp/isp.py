@@ -1,5 +1,5 @@
 """
-Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v1]
+Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v2]
 
 Stage order (each stage needs only a few lines of context or last-frame statistics, so it maps to an FPGA pixel stream):
 
@@ -7,7 +7,7 @@ Stage order (each stage needs only a few lines of context or last-frame statisti
   1  bad-pixel replacement            -> static map + median of good neighbours (before any spatial filter)
   2  residual column (row) FPN removal-> vertical stripes the NUC did not remove
   3  motion-adaptive recursive TNR with global-TRANSLATION compensation (phase correlation) -> low noise, no ghosting
-  4  histogram statistics (frame t-1) -> temporally smoothed, percentile range + plateau-limited equalisation LUT
+  4  absolute-anchored tone curve (frame t-1 stats): slew-limited black point, peak-hold white point, gamma -> no equalisation
   5  base / detail split (fast guided filter) -> compress the base with the LUT, keep + boost detail (no halos)
   6  white-hot 8-bit output
 """
@@ -43,18 +43,21 @@ class Params:
     t0: float = 1.0              # motion gate: mean|d|/sigma_d below t0 -> pure noise
     t1: float = 2.2              #              above t1 -> motion, pass through (k=1)
     cut_ratio: float = 5.0       # global change => scene cut / FFC recovery, reset state
-    # --- AGC
-    p_lo: float = 0.005
-    p_hi: float = 0.9995
-    hist_alpha: float = 0.05     # temporal smoothing of the histogram (anti-flicker)
-    plateau: float = 1.0         # plateau = plateau * mean occupancy inside the range
-    lin_mix: float = 0.5         # 0 = pure equalisation, 1 = linear
-    min_span_sigma: float = 50.0 # never stretch less than this many sigma_n over 0..255
-    min_span_abs: float = 150.0
+    # --- AGC (absolute-anchored, no equalisation)
+    p_lo: float = 0.01           # slow low percentile -> black point
+    hi_pct: float = 0.9995       # per-frame high percentile that feeds the peak-hold
+    lo_slew: float = 1.5         # max black-point change, counts/frame
+    hi_attack: float = 0.15      # peak-hold attack (fraction per frame)
+    hi_decay: float = 0.15       # peak-hold release, counts per frame (very slow)
+    hist_alpha: float = 0.03     # temporal smoothing of the low-percentile histogram
+    gamma: float = 1.15          # >1 keeps big warm surfaces dark/mid, leaves the top for hot anomalies
+    min_span_sigma: float = 50.0
+    min_span_abs: float = 1000.0 # never stretch less than this many counts over 0..255
     # --- detail layer
     gf_radius: int = 8
     edge_frac: float = 0.05      # guided-filter eps = (edge_frac * span)^2
-    detail_gain: float = 1.5
+    detail_gain: float = 2.6
+    hot_boost: float = 1.5       # extra gain for warm small detail (animals, hot spots)
     detail_limit: float = 60.0   # soft clip of the detail in 8-bit levels
     core_k: float = 2.0          # coring threshold in units of post-TNR noise sigma
     white_hot: bool = True
@@ -118,6 +121,7 @@ class ISP:
         self.cs = None           # per-column offset estimate
         self.Hs = None           # smoothed histogram
         self.lut = None
+        self.hi_hold = None
         self.lo, self.hi = 0.0, 16383.0
         self.hist_std = deque(maxlen=16)
         self.freeze = 0
@@ -208,29 +212,28 @@ class ISP:
         self.y += k * d
         return self.y
 
-    def _build_lut(self):
+    def _build_lut(self, hist):
+        """Absolute-anchored tone curve. lo = slow low percentile; hi = peak-hold of the per-frame high percentile,
+        so large warm surfaces (road, roofs) stay mid-grey and only real hot anomalies reach white."""
         p = self.p
-        Hs = self.Hs
-        N = float(Hs.sum()) + 1e-6
-        c = np.cumsum(Hs)
         edges = (np.arange(NB) + 1) << BSH
-        lo = float(np.interp(p.p_lo * N, c, edges)) - 8
-        hi = float(np.interp(p.p_hi * N, c, edges))
+        c = np.cumsum(self.Hs)
+        lo_t = float(np.interp(p.p_lo * c[-1], c, edges)) - 8
+        # black point is slew-limited: a cold region (sky) entering the frame must not re-expose the whole image
+        self.lo_s = lo_t if self.lo_s is None else self.lo_s + float(np.clip(lo_t - self.lo_s, -p.lo_slew, p.lo_slew))
+        lo = self.lo_s
+        cf = np.cumsum(hist)
+        hf = float(np.interp(p.hi_pct * cf[-1], cf, edges))
+        if self.hi_hold is None:
+            self.hi_hold = hf
+        elif hf > self.hi_hold:
+            self.hi_hold += p.hi_attack * (hf - self.hi_hold)
+        else:
+            self.hi_hold -= p.hi_decay                       # very slow release
         min_span = max(p.min_span_abs, p.min_span_sigma * self.sigma_n)
-        if hi - lo < min_span:
-            mid = 0.5 * (hi + lo)
-            lo, hi = mid - 0.5 * min_span, mid + 0.5 * min_span
-        xs = (np.arange(NB) + 0.5) * (1 << BSH)
-        inside = (xs >= lo) & (xs <= hi)
-        n_in = max(1.0, (hi - lo) / (1 << BSH))
-        plateau = p.plateau * float(Hs[inside].sum() + 1e-6) / n_in
-        clipped = np.where(inside, np.minimum(Hs, plateau), 0.0)
-        cdf = np.cumsum(clipped)
-        cdf = cdf / (cdf[-1] + 1e-9)
-        lin = np.clip((xs - lo) / (hi - lo), 0, 1)
-        lut_b = p.lin_mix * lin + (1 - p.lin_mix) * cdf
-        lut_b = np.where(xs < lo, 0.0, np.where(xs > hi, 1.0, lut_b))
-        self.lut = (np.interp(np.arange(MAXV + 1), xs, lut_b) * 255.0).astype(np.float32)
+        hi = max(self.hi_hold, lo + min_span)
+        u = np.clip((np.arange(MAXV + 1) - lo) / (hi - lo), 0.0, 1.0)
+        self.lut = (255.0 * u ** p.gamma).astype(np.float32)
         self.lo, self.hi = lo, hi
 
     def _tonemap(self, y):
@@ -243,7 +246,9 @@ class ISP:
         self.prev_mean = mu_now
         if self.Hs is None or self.cut:
             self.Hs = hist
-            self._build_lut()
+            self.hi_hold = None
+            self.lo_s = None
+            self._build_lut(hist)
             self.cut = False
         # --- fast guided filter base / detail split (a,b at half res, applied at full res)
         span = self.hi - self.lo
@@ -262,16 +267,17 @@ class ISP:
         base = A * I + B0 + mu
         detail = yi - base
         B = np.take(self.lut, np.clip(base, 0, MAXV).astype(np.int32))
-        # --- cored, soft-limited detail
+        # --- cored, soft-limited detail; warm (positive) small detail is boosted more than cold
         sf = float(self.sigma_n * (p.kmin / (2 - p.kmin)) ** 0.5)
         tc2 = float((p.core_k * sf) ** 2)
         d2 = detail * detail
         d8 = p.detail_gain * (255.0 / span) * detail * d2 / (d2 + tc2)
+        d8 += (p.hot_boost - 1.0) * np.maximum(d8, 0.0)
         d8 = d8 / (1.0 + np.abs(d8) / p.detail_limit)
         out = np.clip(B + d8, 0, 255).astype(np.uint8)
         # --- statistics of this frame set the curve of the next one (1-frame latency, no pixel buffer)
         self.Hs += p.hist_alpha * (hist - self.Hs)
-        self._build_lut()
+        self._build_lut(hist)
         return out
 
     # ------------------------------------------------------------------ API
