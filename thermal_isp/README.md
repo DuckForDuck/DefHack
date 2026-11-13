@@ -1,14 +1,15 @@
-# Thermal ISP (v3): 14-bit post-NUC 640x512 -> stable 8-bit white-hot
+# Thermal ISP (v3.1): 14-bit post-NUC 640x512 -> stable 8-bit white-hot
 
 Run (Python 3, numpy, opencv-python, ffmpeg in PATH):
 
     pip install -r requirements.txt
     python analyze.py data.bin            # what is still wrong after NUC (noise, stripes, shutter frames, bad pixels)
     python run.py data.bin -o out         # out/*_whitehot.mp4, *_compare.mp4 (naive >>6 | ISP), before/after PNG, timings
+    python compare_versions.py data.bin out   # v3 vs v3.1 side by side
 
 Flags: --row-fpn, --detail-gain G, --black-hot, --max-frames N. All parameters: `Params` in isp.py.
 
-## Pipeline (v3)
+## Pipeline (v3.1)
 | # | Stage | Fixes |
 |---|-------|-------|
 | 0 | Shutter/FFC guard: flat frame -> repeat last output, skip state update | gray/flashing frame during FFC |
@@ -16,7 +17,7 @@ Flags: --row-fpn, --detail-gain G, --black-hot, --max-frames N. All parameters: 
 | 2 | Residual column FPN: clipped horizontal high-pass averaged over rows, IIR over time | vertical stripes left by NUC |
 | 3 | Motion-compensated recursive TNR: similarity transform (shift+roll+zoom) from LK-tracked corners + RANSAC (fallbacks: phase-correlation shift, then hold last), plus dense 1/4-res flow for parallax, one combined cubic warp of the state -> per-pixel k = 1/4 static ... 1 moving, vs spatially measured noise sigma | temporal noise, no ghosting on a panning camera |
 | 4 | Absolute-anchored tone curve from frame t-1 statistics: black point = slow 1% percentile (slew-limited 1.5 counts/frame), white point = peak-hold of the per-frame 99.95% percentile (min stretch 1000 counts), gamma 1.15, shadow lift 0.12. No histogram equalisation | brightness stability / how bright large warm surfaces look |
-| 5 | Fast guided-filter base/detail split; LUT on base; detail x2.6, warm detail x1.5 more with coring + soft clip | local contrast without halos or plastic texture |
+| 5 | Fast guided-filter base/detail split; LUT on base; detail x2.6, warm detail x1.5 more with coring + soft clip; **5b** white top-hat (opening ~14 px) adds a boost to compact hot features above 150 counts | local contrast without halos or plastic texture |
 | 6 | white-hot 8-bit | |
 
 FPGA mapping: one frame buffer (TNR state) 640x512x16 bit = 640 KB; a few line buffers (bad pixels 3, column FPN 15-px shift register + 640 accumulators, guided filter ~5 lines at half res); histogram 2048x24 bit; LUT 16K x 8 bit. Statistics stages have a 1-frame latency, the pixel path ~20 lines.
@@ -34,3 +35,5 @@ Bad-pixel statistics are computed over the whole clip. On very short or nearly s
   Result: Road/ground mid-grey, animals brightest; max frame-to-frame mean-brightness jump 8.3 -> 2.0 levels. Weakness: temporal filter barely worked (k=0.72) because registration was poor.
 - **v3**: Motion estimation: similarity transform (shift+rotation+scale) from LK corners + RANSAC, then dense local flow at 1/4 resolution for parallax, one cubic warp. Shadow lift (shadow_lift=0.12).
   Result: k 0.72 -> 0.40, residual 2.07 -> 1.04 sigma; vegetation shadows +21 levels, ground +8..13, animals unchanged. Cost: 12 -> ~23 ms/frame.
+- **v3.1**: Boost of compact warm anomalies (white top-hat, ~14 px window, threshold 150 counts).
+  Result: Lone spot 182 -> 240; road, ground, canopy, roofs unchanged (+0); at most 0.7% of the frame changes. Cost ~+1 ms.

@@ -1,5 +1,5 @@
 """
-Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v3]
+Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v3.1]
 
 Stage order (each stage needs only a few lines of context or last-frame statistics, so it maps to an FPGA pixel stream):
 
@@ -9,6 +9,7 @@ Stage order (each stage needs only a few lines of context or last-frame statisti
   3  motion-adaptive recursive TNR, similarity (shift+roll+zoom) motion from LK corners + dense local flow -> low noise, no ghosting
   4  absolute-anchored tone curve (frame t-1 stats): slew-limited black point, peak-hold white point, gamma -> no equalisation + shadow lift
   5  base / detail split (fast guided filter) -> compress the base with the LUT, keep + boost detail (no halos)
+  5b compact hot-anomaly boost (white top-hat) -> lone hot spots / animals reach white, big warm areas do not
   6  white-hot 8-bit output
 """
 from collections import deque
@@ -61,6 +62,9 @@ class Params:
     gf_radius: int = 8
     edge_frac: float = 0.05      # guided-filter eps = (edge_frac * span)^2
     detail_gain: float = 2.6
+    top_gain: float = 1.1        # v3.1: boost of compact hot anomalies (0 = off)
+    top_thr: float = 150.0       # counts above the local opening before the boost starts
+    top_k: int = 7               # opening size at half res (~14 px full res)
     hot_boost: float = 1.5       # extra gain for warm small detail (animals, hot spots)
     detail_limit: float = 60.0   # soft clip of the detail in 8-bit levels
     core_k: float = 2.0          # coring threshold in units of post-TNR noise sigma
@@ -341,6 +345,15 @@ class ISP:
         d8 = p.detail_gain * (255.0 / span) * detail * d2 / (d2 + tc2)
         d8 += (p.hot_boost - 1.0) * np.maximum(d8, 0.0)
         d8 = d8 / (1.0 + np.abs(d8) / p.detail_limit)
+        # --- compact-anomaly boost: white top-hat (feature smaller than ~14 px that is hotter than its surroundings).
+        # Large warm surfaces (road, roofs) and tree crowns stay below the threshold; a lone hot spot or an animal does not.
+        # The guided filter keeps such a step in the base layer, so the detail boost above never reaches it.
+        if p.top_gain:
+            Ys = cv2.resize(yi, (W // 2, H // 2), interpolation=cv2.INTER_AREA)
+            th = Ys - cv2.morphologyEx(Ys, cv2.MORPH_OPEN, np.ones((p.top_k, p.top_k), np.uint8))
+            th = cv2.resize(th, (W, H), interpolation=cv2.INTER_LINEAR)
+            thr = max(p.top_thr, 25.0 * self.sigma_n)
+            d8 = d8 + p.top_gain * (255.0 / span) * np.maximum(th - thr, 0.0)
         out = np.clip(B + d8, 0, 255).astype(np.uint8)
         # --- statistics of this frame set the curve of the next one (1-frame latency, no pixel buffer)
         self.Hs += p.hist_alpha * (hist - self.Hs)
