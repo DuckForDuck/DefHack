@@ -1,5 +1,5 @@
 """
-Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v3.1]
+Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v3.2]
 
 Stage order (each stage needs only a few lines of context or last-frame statistics, so it maps to an FPGA pixel stream):
 
@@ -71,8 +71,15 @@ class Params:
     white_hot: bool = True
 
 
+def _noise_sigma(f):
+    """Spatial noise sigma (Laplacian MAD); not polluted by scene motion."""
+    l = cv2.Laplacian(f.astype(np.float32), cv2.CV_32F)[::2, ::2]
+    return max(0.5, 1.4826 * float(np.median(np.abs(l))) / 4.4721)
+
+
 def find_bad_pixels(stack, k=6.0):
-    """stack: (N,H,W) uint16 sampled over the sequence (FPGA: collected once at start-up)."""
+    """stack: (N,H,W) uint16 sampled over the sequence (FPGA: collected once at start-up).
+    The sd-based tests need >= 8 frames; with fewer only hard-stuck values and isolated outliers are used."""
     s = stack.astype(np.float32)
     sub = s[:, ::4, ::4].reshape(len(s), -1)
     fs = sub.std(1)
@@ -83,11 +90,17 @@ def find_bad_pixels(stack, k=6.0):
     sd = s.std(0)
     med_sd = float(np.median(sd)) + 1e-3
     sd_loc = cv2.medianBlur(sd, 5)
-    noisy = (sd > 3.0 * sd_loc) & (sd > 2.5 * med_sd)           # blinkers / popcorn
-    stuck = (sd < 0.15 * med_sd) | (stack.max(0) == 0) | (stack.min(0) >= MAXV)   # dead / saturated
+    sig = float(np.median([_noise_sigma(f) for f in s[:8]]))     # real temporal-noise scale (~sensor NETD)
+    enough = len(s) >= 8
+    noisy = (sd > 3.0 * sd_loc) & (sd > 2.5 * med_sd) & enough   # blinkers / popcorn
+    # frozen pixel: std far below the sensor noise (NOT relative to the sequence-wide std, which is dominated by scene motion)
+    stuck = ((sd < 0.25 * sig) & enough) | (stack.max(0) == 0) | (stack.min(0) >= MAXV)   # dead / saturated
     med3 = cv2.medianBlur(m, 3)
     d = m - med3
     mad = 1.4826 * float(np.median(np.abs(d))) + 1e-3
+    # The MAD of a median-filter residual is zero-inflated (can be ~0 on a static scene), so the threshold is also
+    # floored by the known noise of the N-frame mean: sigma / sqrt(N).  Otherwise short clips flag thousands of pixels.
+    mad = max(mad, sig / np.sqrt(len(s)))
     ker = np.ones((3, 3), np.uint8)
     ker[1, 1] = 0
     nb_max = cv2.dilate(d, ker)

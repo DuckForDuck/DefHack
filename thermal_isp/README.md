@@ -1,4 +1,4 @@
-# Thermal ISP (v3.1): 14-bit post-NUC 640x512 -> stable 8-bit white-hot
+# Thermal ISP (v3.2): 14-bit post-NUC 640x512 -> stable 8-bit white-hot
 
 Run (Python 3, numpy, opencv-python, ffmpeg in PATH):
 
@@ -37,3 +37,5 @@ Bad-pixel statistics are computed over the whole clip. On very short or nearly s
   Result: k 0.72 -> 0.40, residual 2.07 -> 1.04 sigma; vegetation shadows +21 levels, ground +8..13, animals unchanged. Cost: 12 -> ~23 ms/frame.
 - **v3.1**: Boost of compact warm anomalies (white top-hat, ~14 px window, threshold 150 counts).
   Result: Lone spot 182 -> 240; road, ground, canopy, roofs unchanged (+0); at most 0.7% of the frame changes. Cost ~+1 ms.
+- **v3.2**: Bad-pixel detector fixed for short clips: frozen-pixel test tied to the measured sensor noise (not to the sequence-wide std), sd-based tests need >= 8 frames, hot/cold threshold floored by sigma/sqrt(N).
+  Result: false positives on real clips of 5/15/60 frames 7426/4146/1032 -> 19/15/2; full 275-frame file unchanged (identical mask, 2 pixels). Run `python test_bad_pixels.py`.
