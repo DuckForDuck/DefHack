@@ -1,4 +1,4 @@
-# Thermal ISP (v2): 14-bit post-NUC 640x512 -> stable 8-bit white-hot
+# Thermal ISP (v3): 14-bit post-NUC 640x512 -> stable 8-bit white-hot
 
 Run (Python 3, numpy, opencv-python, ffmpeg in PATH):
 
@@ -8,14 +8,14 @@ Run (Python 3, numpy, opencv-python, ffmpeg in PATH):
 
 Flags: --row-fpn, --detail-gain G, --black-hot, --max-frames N. All parameters: `Params` in isp.py.
 
-## Pipeline (v2)
+## Pipeline (v3)
 | # | Stage | Fixes |
 |---|-------|-------|
 | 0 | Shutter/FFC guard: flat frame -> repeat last output, skip state update | gray/flashing frame during FFC |
 | 1 | Bad pixels: static map + median of good 8-neighbours (real small targets are kept: a PSF raises the neighbours) | white/black dots |
 | 2 | Residual column FPN: clipped horizontal high-pass averaged over rows, IIR over time | vertical stripes left by NUC |
-| 3 | Motion-adaptive recursive TNR with global-TRANSLATION compensation: phase-correlation shift (half res, smoothed, held when unreliable) -> cubic warp of the state -> per-pixel k = 1/4 static ... 1 moving, from 3x3-pooled |frame-state| vs spatially measured noise sigma (Laplacian MAD) | temporal noise, no ghosting on a panning camera |
-| 4 | Absolute-anchored tone curve from frame t-1 statistics: black point = slow 1% percentile (slew-limited 1.5 counts/frame), white point = peak-hold of the per-frame 99.95% percentile (min stretch 1000 counts), gamma 1.15. No histogram equalisation | brightness stability / how bright large warm surfaces look |
+| 3 | Motion-compensated recursive TNR: similarity transform (shift+roll+zoom) from LK-tracked corners + RANSAC (fallbacks: phase-correlation shift, then hold last), plus dense 1/4-res flow for parallax, one combined cubic warp of the state -> per-pixel k = 1/4 static ... 1 moving, vs spatially measured noise sigma | temporal noise, no ghosting on a panning camera |
+| 4 | Absolute-anchored tone curve from frame t-1 statistics: black point = slow 1% percentile (slew-limited 1.5 counts/frame), white point = peak-hold of the per-frame 99.95% percentile (min stretch 1000 counts), gamma 1.15, shadow lift 0.12. No histogram equalisation | brightness stability / how bright large warm surfaces look |
 | 5 | Fast guided-filter base/detail split; LUT on base; detail x2.6, warm detail x1.5 more with coring + soft clip | local contrast without halos or plastic texture |
 | 6 | white-hot 8-bit | |
 
@@ -32,3 +32,5 @@ Bad-pixel statistics are computed over the whole clip. On very short or nearly s
   Result: Weakness: equalisation stretches the most populated levels, so road/ground/roofs drift to white and brightness wanders with frame content.
 - **v2**: Absolute tone scale instead of equalisation: slow, slew-limited black point, peak-hold white point, gamma 1.15; detail x2.6, warm detail a further x1.5.
   Result: Road/ground mid-grey, animals brightest; max frame-to-frame mean-brightness jump 8.3 -> 2.0 levels. Weakness: temporal filter barely worked (k=0.72) because registration was poor.
+- **v3**: Motion estimation: similarity transform (shift+rotation+scale) from LK corners + RANSAC, then dense local flow at 1/4 resolution for parallax, one cubic warp. Shadow lift (shadow_lift=0.12).
+  Result: k 0.72 -> 0.40, residual 2.07 -> 1.04 sigma; vegetation shadows +21 levels, ground +8..13, animals unchanged. Cost: 12 -> ~23 ms/frame.

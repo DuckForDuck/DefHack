@@ -1,13 +1,13 @@
 """
-Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v2]
+Streaming-friendly ISP for an uncooled 640x512 microbolometer (post-NUC 14-bit -> stable 8-bit white-hot).   [v3]
 
 Stage order (each stage needs only a few lines of context or last-frame statistics, so it maps to an FPGA pixel stream):
 
   0  shutter / FFC frame guard        -> freeze the output instead of showing a flat gray frame
   1  bad-pixel replacement            -> static map + median of good neighbours (before any spatial filter)
   2  residual column (row) FPN removal-> vertical stripes the NUC did not remove
-  3  motion-adaptive recursive TNR with global-TRANSLATION compensation (phase correlation) -> low noise, no ghosting
-  4  absolute-anchored tone curve (frame t-1 stats): slew-limited black point, peak-hold white point, gamma -> no equalisation
+  3  motion-adaptive recursive TNR, similarity (shift+roll+zoom) motion from LK corners + dense local flow -> low noise, no ghosting
+  4  absolute-anchored tone curve (frame t-1 stats): slew-limited black point, peak-hold white point, gamma -> no equalisation + shadow lift
   5  base / detail split (fast guided filter) -> compress the base with the LUT, keep + boost detail (no halos)
   6  white-hot 8-bit output
 """
@@ -38,6 +38,9 @@ class Params:
     row_fpn: bool = False        # enable only if analyze.py shows row banding
     # --- temporal noise reduction
     kmin: float = 1 / 4          # static-pixel IIR weight  (noise std -> ~0.38x)
+    motion: str = 'affine'       # 'affine' (v3: LK corners + RANSAC similarity) | 'translate' (v2)
+    local_flow: bool = True      # residual dense flow for parallax
+    flow_limit: float = 3.0
     min_resp: float = 0.15       # phase-correlation confidence below which TNR is bypassed
     max_shift: float = 24.0      # px/frame
     t0: float = 1.0              # motion gate: mean|d|/sigma_d below t0 -> pure noise
@@ -50,6 +53,7 @@ class Params:
     hi_attack: float = 0.15      # peak-hold attack (fraction per frame)
     hi_decay: float = 0.15       # peak-hold release, counts per frame (very slow)
     hist_alpha: float = 0.03     # temporal smoothing of the low-percentile histogram
+    shadow_lift: float = 0.12    # v3: raise dark vegetation without lifting road/roofs (0 = v2)
     gamma: float = 1.15          # >1 keeps big warm surfaces dark/mid, leaves the top for hot anomalies
     min_span_sigma: float = 50.0
     min_span_abs: float = 1000.0 # never stretch less than this many counts over 0..255
@@ -110,10 +114,14 @@ class ISP:
         self.n_bad = len(ys)
 
     def reset(self):
+        self.gx, self.gy = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
         self.y = None            # TNR frame buffer
         self.sig_d = None
         self.feat = None
         self.sm = (0.0, 0.0)
+        self.M_last = np.float32([[1, 0, 0], [0, 1, 0]])
+        self.src = 'none'
+        self.diag = (0, 0, 0)
         self.shift = (0, 0, 0)
         self.prev_mean = None
         self.win = cv2.createHanningWindow((W // 2, H // 2), cv2.CV_32F)
@@ -172,43 +180,99 @@ class ISP:
         l = cv2.Laplacian(x, cv2.CV_32F)[::2, ::2]
         return max(0.5, 1.4826 * float(np.median(np.abs(l))) / 4.4721)
 
-    def _est_shift(self, x):
-        """Global translation prev->cur in full-res pixels (phase correlation at half res; FPGA: row/col projections)."""
+    def _features(self, x):
         f = cv2.resize(x, (W // 2, H // 2), interpolation=cv2.INTER_AREA)
-        f = cv2.GaussianBlur(f, (0, 0), 1.0)
-        f -= float(f.mean())
-        if self.feat is None:
-            self.feat, res = f, (0.0, 0.0, 0.0)
-        else:
-            (dx, dy), r = cv2.phaseCorrelate(self.feat, f, self.win)
-            self.feat, res = f, (2.0 * dx, 2.0 * dy, r)
-        return res
+        return cv2.GaussianBlur(f, (0, 0), 1.0)
 
-    def _temporal(self, x):
+    def _motion_translate(self, prev, f):
+        """v2: global translation by phase correlation, smoothed, held when unreliable (FPGA: projection correlation)."""
         p = self.p
-        sn = self._est_noise(x)
-        self.sigma_n = sn if self.y is None else self.sigma_n + 0.1 * (sn - self.sigma_n)
-        dx, dy, resp = self._est_shift(x)
-        if self.y is None:
-            self.y = x.copy()
-            return self.y
-        # camera motion is smooth: low-confidence / absurd measurements are blended toward (or replaced by)
-        # the previous estimate instead of dropping the temporal filter (which would alternate clean/noisy frames)
+        (dx, dy), resp = cv2.phaseCorrelate(prev - float(prev.mean()), f - float(f.mean()), self.win)
+        dx, dy = 2.0 * dx, 2.0 * dy
         if abs(dx) > p.max_shift or abs(dy) > p.max_shift:
             resp = 0.0
         a_s = float(np.clip(resp / p.min_resp, 0.0, 1.0)) if resp < p.min_resp else 1.0
         if resp >= p.min_resp * 0.5 and a_s > 0:
             self.sm = (self.sm[0] + a_s * (dx - self.sm[0]), self.sm[1] + a_s * (dy - self.sm[1]))
-        dx, dy = self.sm
-        self.shift = (dx, dy, resp)
-        if abs(dx) > 0.02 or abs(dy) > 0.02:
-            M = np.float32([[1, 0, dx], [0, 1, dy]])
-            self.y = cv2.warpAffine(self.y, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return np.float32([[1, 0, self.sm[0]], [0, 1, self.sm[1]]]), resp
+
+    def _motion_affine(self, prev, f):
+        """v3: similarity transform (shift + roll + zoom) from sparse corners tracked with pyramidal LK + RANSAC.
+        Handles the camera roll / zoom that a pure translation cannot. Returns (M or None, inlier ratio)."""
+        p = self.p
+        lo, hi = np.percentile(f[::2, ::2], (1, 99.5))
+        sc = 255.0 / max(float(hi - lo), 1.0)
+        a = np.clip((prev - lo) * sc, 0, 255).astype(np.uint8)
+        b = np.clip((f - lo) * sc, 0, 255).astype(np.uint8)
+        pts = cv2.goodFeaturesToTrack(a, 400, 0.005, 6, blockSize=5)
+        if pts is None or len(pts) < 30:
+            return None, 0.0
+        nxt, st, _ = cv2.calcOpticalFlowPyrLK(a, b, pts, None, winSize=(21, 21), maxLevel=3)
+        ok = st.ravel() == 1
+        if ok.sum() < 25:
+            return None, 0.0
+        M, inl = cv2.estimateAffinePartial2D(pts[ok], nxt[ok], method=cv2.RANSAC,
+                                             ransacReprojThreshold=1.5, maxIters=300, confidence=0.99)
+        if M is None:
+            return None, 0.0
+        ratio = float(inl.mean())
+        A = M[:, :2]
+        t = 2.0 * M[:, 2] + 0.5 * (np.eye(2) - A) @ np.ones(2)     # half-res -> full-res coordinates
+        M2 = np.hstack([A, t[:, None]]).astype(np.float32)
+        if inl.sum() < 20 or ratio < 0.35 or np.abs(M2[:, 2]).max() > p.max_shift:
+            return None, ratio
+        return M2, ratio
+
+    def _warp_state(self, y, M, x):
+        p = self.p
+        if not p.local_flow:
+            return cv2.warpAffine(y, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        # residual local motion (parallax: trees vs ground) with dense flow at 1/4 res; one combined cubic remap
+        q = (W // 4, H // 4)
+        Mq = M.copy()
+        Mq[:, 2] /= 4.0
+        yq = cv2.warpAffine(cv2.resize(y, q, interpolation=cv2.INTER_AREA), Mq, q, borderMode=cv2.BORDER_REPLICATE)
+        xq = cv2.resize(x, q, interpolation=cv2.INTER_AREA)
+        lo, hi = np.percentile(xq, (1, 99.5))
+        sc = 255.0 / max(float(hi - lo), 1.0)
+        x8 = np.clip((xq - lo) * sc, 0, 255).astype(np.uint8)
+        y8 = np.clip((yq - lo) * sc, 0, 255).astype(np.uint8)
+        fl = cv2.calcOpticalFlowFarneback(x8, y8, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        fl = np.clip(cv2.resize(fl, (W, H), interpolation=cv2.INTER_LINEAR) * 4.0, -p.flow_limit, p.flow_limit)
+        Ai = cv2.invertAffineTransform(M)
+        sx = Ai[0, 0] * self.gx + Ai[0, 1] * self.gy + Ai[0, 2] + Ai[0, 0] * fl[..., 0] + Ai[0, 1] * fl[..., 1]
+        sy = Ai[1, 0] * self.gx + Ai[1, 1] * self.gy + Ai[1, 2] + Ai[1, 0] * fl[..., 0] + Ai[1, 1] * fl[..., 1]
+        return cv2.remap(y, sx.astype(np.float32), sy.astype(np.float32), cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    def _temporal(self, x):
+        p = self.p
+        sn = self._est_noise(x)
+        self.sigma_n = sn if self.y is None else self.sigma_n + 0.1 * (sn - self.sigma_n)
+        f = self._features(x)
+        prev, self.feat = self.feat, f
+        if self.y is None or prev is None:
+            self.y = x.copy()
+            return self.y
+        M, ratio, src = None, 0.0, "hold"
+        if p.motion == "affine":
+            M, ratio = self._motion_affine(prev, f)
+            src = "lk"
+        if M is None:                                           # translation fallback / v2 mode
+            Mt, resp = self._motion_translate(prev, f)
+            if p.motion == "translate" or resp >= p.min_resp:
+                M, ratio, src = Mt, resp, "pc"
+        if M is None:
+            M, src = self.M_last, "hold"                        # camera motion is smooth: keep the last estimate
+        else:
+            self.M_last = M
+        self.shift, self.src = (float(M[0, 2]), float(M[1, 2]), ratio), src
+        self.y = self._warp_state(self.y, M, x)
         sig_d = float(self.sigma_n * (1.0 + p.kmin / (2 - p.kmin)) ** 0.5)
         d = x - self.y
         a = cv2.blur(np.abs(d), (3, 3))                       # pooled: motion is coherent, noise is not
         t = np.clip((a / sig_d - p.t0) / (p.t1 - p.t0), 0.0, 1.0)
         k = p.kmin + (1.0 - p.kmin) * t * t * (3.0 - 2.0 * t)
+        self.diag = (float(np.median(a[::4, ::4])) / sig_d, float((k > 0.5).mean()), float(k.mean()))
         self.y += k * d
         return self.y
 
@@ -233,7 +297,10 @@ class ISP:
         min_span = max(p.min_span_abs, p.min_span_sigma * self.sigma_n)
         hi = max(self.hi_hold, lo + min_span)
         u = np.clip((np.arange(MAXV + 1) - lo) / (hi - lo), 0.0, 1.0)
-        self.lut = (255.0 * u ** p.gamma).astype(np.float32)
+        v = u ** p.gamma
+        if p.shadow_lift:
+            v = np.clip(v + p.shadow_lift * 14.9 * v * (1.0 - v) ** 5, 0.0, 1.0)   # lifts the shadows, ~no change above mid-grey
+        self.lut = (255.0 * v).astype(np.float32)
         self.lo, self.hi = lo, hi
 
     def _tonemap(self, y):
