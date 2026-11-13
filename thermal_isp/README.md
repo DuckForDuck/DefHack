@@ -39,3 +39,8 @@ Bad-pixel statistics are computed over the whole clip. On very short or nearly s
   Result: Lone spot 182 -> 240; road, ground, canopy, roofs unchanged (+0); at most 0.7% of the frame changes. Cost ~+1 ms.
 - **v3.2**: Bad-pixel detector fixed for short clips: frozen-pixel test tied to the measured sensor noise (not to the sequence-wide std), sd-based tests need >= 8 frames, hot/cold threshold floored by sigma/sqrt(N).
   Result: false positives on real clips of 5/15/60 frames 7426/4146/1032 -> 19/15/2; full 275-frame file unchanged (identical mask, 2 pixels). Run `python test_bad_pixels.py`.
+
+## Streaming check
+`python stream_demo.py normal_nuc_2.bin --fps 25` replays the file as a camera (one frame at a time, bad-pixel map from the first 16 frames) and reports per-frame processing time, queueing latency and frames over budget.
+Measured on 2 shared cores: 25 fps -> mean 25.7 ms, p99 35.0, max 39.3 ms, 0 of 275 frames over the 40 ms budget; 30 fps -> 6 of 275 over budget (max backlog 1 frame).
+
