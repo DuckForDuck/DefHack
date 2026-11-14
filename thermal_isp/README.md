@@ -44,3 +44,17 @@ Bad-pixel statistics are computed over the whole clip. On very short or nearly s
 `python stream_demo.py normal_nuc_2.bin --fps 25` replays the file as a camera (one frame at a time, bad-pixel map from the first 16 frames) and reports per-frame processing time, queueing latency and frames over budget.
 Measured on 2 shared cores: 25 fps -> mean 25.7 ms, p99 35.0, max 39.3 ms, 0 of 275 frames over the 40 ms budget; 30 fps -> 6 of 275 over budget (max backlog 1 frame).
 
+## Dataset for a learned enhancement model
+`python make_dataset.py normal_nuc_2.bin -o dataset --full` builds noisy/clean pairs from the real file (no synthetic scene):
+- input: the real raw frame (real noise, column FPN, bad pixels);
+- target: offline, non-causal average of +-8 neighbouring real frames aligned by chained adjacent-frame motion (similarity + local flow) with per-pixel gating against moving objects;
+- outputs: 128x128 patches in train/val/test .npz (time split with gaps, so neighbouring frames never leak across splits), a full-frame clean .bin in the layout of the input, a noise bank and a quality report.
+
+Why chained motion: the camera pans 6-14 px per frame; direct LK between frames more than 1-2 apart locks on wrong points.
+Target quality (12 sampled frames): raw sigma 6.08 counts, about 10 frames effectively averaged, noise of independent half-sets 2.42 vs ideal 2.58 (no misalignment excess), sharpness ratio vs raw 1.001. The target still contains about 2.4 counts of noise; it is a 2.5x cleaner reference, not a perfect one.
+
+The sensor noise is not white (lag-1 correlation about 0.2, power concentrated at low frequencies), so a Gaussian noise model was tried and rejected. `NoiseBank` transplants real residuals (raw - clean) from training frames onto clean patches; on test frames it matches the real residual: sigma 5.93 vs 5.93, lag-1 correlation 0.20/0.23 vs 0.17/0.20.
+
+`python train_demo.py dataset --minutes 8` (needs PyTorch) trains a 117k-parameter U-Net on CPU. Measured on 2 shared vCPUs: 2.45 s per batch of 16 patches (6.5 patches/s), about 3 epochs in 8 minutes; inference 127 ms per 640x512 frame (too slow for 25 fps on that CPU).
+Real test patches from the last 15% of the clip (error vs clean target): raw 5.93 counts, Gaussian blur 3.73 (sharpness 0.92), network 3.37 (sharpness 0.98). Still improving when stopped; test frames come from the same scene, so generalisation to new scenes is untested.
+
