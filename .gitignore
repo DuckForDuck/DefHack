@@ -1,0 +1,8 @@
+*.textClipping
+.DS_Store
+build/
+*.
+output/
+obj/
+.vscode/
+**/.DS_Store
