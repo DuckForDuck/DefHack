@@ -1,0 +1,24 @@
+{
+  "note": "",
+  "saved_at": "2026-11-14 00:48:09",
+  "values": {
+    "BaseDetailSplit.edge_dn": 25.0,
+    "BaseDetailSplit.radius": 8,
+    "DetailEnhance.coring_k": 2.0,
+    "DetailEnhance.gain": 1.5,
+    "DetailEnhance.max_amp": 0.06,
+    "DetailEnhance.sigma": 1.2,
+    "SpatialDenoise.strength": 1.5,
+    "TemporalDenoise.max_frames": 8,
+    "TemporalDenoise.pixel_hi": 5.0,
+    "ToneMap.detail_gain": 1.5,
+    "ToneMap.foot": 0.05,
+    "ToneMap.gamma": 1.3,
+    "ToneMap.knee": 0.7,
+    "ToneMap.linear_mix": 1.0,
+    "ToneMap.p_high": 99.8,
+    "ToneMap.p_low": 0.2,
+    "ToneMap.plateau": 3.0,
+    "ToneMap.white": 1.0
+  }
+}

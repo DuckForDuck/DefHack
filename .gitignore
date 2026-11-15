@@ -6,3 +6,23 @@ output/
 obj/
 .vscode/
 **/.DS_Store
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- generated output / data ---
+debug/
+*.mp4
+*.mkv
+*.log
+data/
+*.npy
+*.npz
+*.raw
+*.y16
+*.bin
+_backup*/
+*.tgz
